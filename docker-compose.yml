@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - honeypot-logs:/var/log/nginx/shared
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - htpasswd:/etc/nginx/
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+
+  python-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    volumes:
+      - honeypot-logs:/var/log/nginx/shared
+      - analyzer-db:/app/db
+    restart: unless-stopped
+    environment:
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+    networks:
+      - dokploy-network
+
+  # Jalankan sekali untuk generate file .htpasswd
+  htpasswd-init:
+    image: httpd:alpine
+    volumes:
+      - htpasswd:/output
+    command: >
+      sh -c "htpasswd -bc /output/.htpasswd ${DASHBOARD_USER:-jibril} ${DASHBOARD_PASS:-changeme} &&
+             echo '.htpasswd berhasil dibuat'"
+    restart: "no"
+
+volumes:
+  honeypot-logs:
+  analyzer-db:
+  htpasswd:
+
+networks:
+  dokploy-network:
+    external: true
