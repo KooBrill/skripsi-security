@@ -37,7 +37,9 @@ UA_WEIGHTS = {
     "curl":             5,
 }
 
-# ── Setup Database ────────────────────────────────────────────
+# ── Setup Database SQLite ─────────────────────────────────────
+# SQLite = memori sementara untuk akumulasi skor per IP
+# Data final dikirim ke Supabase via n8n webhook
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -67,7 +69,7 @@ def calculate_score(uri: str, user_agent: str, is_tool: int) -> int:
                 break
     return score
 
-# ── Update Skor IP ────────────────────────────────────────────
+# ── Update Skor IP di SQLite ──────────────────────────────────
 def update_ip_score(con, ip: str, delta: int) -> dict:
     now = datetime.utcnow().isoformat()
     con.execute("""
@@ -83,25 +85,29 @@ def update_ip_score(con, ip: str, delta: int) -> dict:
     ).fetchone()
     return {"score": row[0], "reported": row[1]}
 
-# ── Kirim Webhook ke n8n ──────────────────────────────────────
-def trigger_webhook(ip: str, score: int):
+# ── Kirim ke n8n ─────────────────────────────────────────────
+# Payload dibedakan:
+# type "hit"  → insert ke tabel log_layer7 (setiap serangan)
+# type "ban"  → insert ke tabel log_banned (saat blokir)
+def trigger_webhook(payload: dict):
     if not WEBHOOK_URL:
-        print(f"[WARN] WEBHOOK_URL belum di-set. Skip untuk {ip}")
+        print(f"[WARN] WEBHOOK_URL belum di-set. Skip.")
         return
     try:
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if WEBHOOK_SECRET:
             headers["X-Webhook-Secret"] = WEBHOOK_SECRET
-        resp = requests.post(WEBHOOK_URL, json={
-            "ip_address": ip,
-            "score":      score,
-            "timestamp":  datetime.utcnow().isoformat()
-        }, headers=headers, timeout=5)
-        print(f"[ALERT] Webhook terkirim untuk {ip} (skor: {score}) → {resp.status_code}")
+        resp = requests.post(
+            WEBHOOK_URL,
+            json=payload,
+            headers=headers,
+            timeout=5
+        )
+        print(f"[WEBHOOK] type={payload['type']} ip={payload['ip_address']} → {resp.status_code}")
     except requests.RequestException as e:
         print(f"[ERROR] Gagal kirim webhook: {e}")
 
-# ── Hapus Data Lama ──────────────────────────────────────────
+# ── Hapus Data Lama dari SQLite ───────────────────────────────
 def cleanup_old_records(con):
     cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
     con.execute("DELETE FROM ip_scores WHERE last_seen < ?", (cutoff,))
@@ -135,18 +141,44 @@ def main():
             uri        = entry.get("uri", "")
             user_agent = entry.get("ua", "")
             is_tool    = int(entry.get("tool", 0))
+            now        = datetime.utcnow().isoformat()
 
             if not ip:
                 continue
 
+            # Hitung skor untuk hit ini
             delta  = calculate_score(uri, user_agent, is_tool)
             result = update_ip_score(con, ip, delta)
 
-            print(f"[LOG] {ip} | +{delta} poin | Total: {result['score']}")
+            print(f"[LOG] {ip} | uri={uri} | +{delta} poin | Total: {result['score']}")
 
+            # Kirim setiap hit ke n8n → insert ke log_layer7
+            trigger_webhook({
+                "type":        "hit",
+                "ip_address":  ip,
+                "uri":         uri,
+                "user_agent":  user_agent,
+                "score_delta": delta,
+                "total_score": result["score"],
+                "is_tool":     is_tool == 1,
+                "detected_at": now
+            })
+
+            # Kalau skor >= 100 dan belum pernah diblokir → kirim ban
             if result["score"] >= SCORE_LIMIT and result["reported"] == 0:
-                trigger_webhook(ip, result["score"])
-                con.execute("UPDATE ip_scores SET reported = 1 WHERE ip = ?", (ip,))
+                print(f"[ALERT] {ip} melewati batas skor {SCORE_LIMIT} → BLOKIR")
+
+                trigger_webhook({
+                    "type":        "ban",
+                    "ip_address":  ip,
+                    "final_score": result["score"],
+                    "banned_at":   now
+                })
+
+                # Tandai sudah dilaporkan di SQLite
+                con.execute(
+                    "UPDATE ip_scores SET reported = 1 WHERE ip = ?", (ip,)
+                )
                 con.commit()
 
         except json.JSONDecodeError:
