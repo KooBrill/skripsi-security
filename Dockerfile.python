@@ -2,10 +2,12 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN pip install requests --no-cache-dir
+RUN pip install requests redis --no-cache-dir
 
 RUN mkdir -p /app/db
 
 COPY analyzer.py .
+
+EXPOSE 8080
 
 CMD ["python", "-u", "analyzer.py"]
