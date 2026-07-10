@@ -123,6 +123,12 @@ def ban_ip(ip: str, score: int) -> dict:
         print(f"[PERMANENT BAN] {ip} | ban ke-{ban_count} → ESKALASI KE UFW")
     else:
         print(f"[BAN] {ip} | ban ke-{ban_count} | durasi: {label} | skor: {score}")
+    log_system_event(
+        "ban_executed", "python-analyzer",
+        f"IP {ip} diblokir (ban ke-{ban_count})",
+        metadata={"ip": ip, "ban_count": ban_count, "duration": label, "score": score},
+        severity="warning"
+    )
 
     return ban_data
 
@@ -254,6 +260,28 @@ def trigger_webhook(payload: dict):
     except requests.RequestException as e:
         print(f"[ERROR] Gagal kirim webhook: {e}")
 
+def log_system_event(event_type: str, component: str, message: str,
+                      metadata: dict = None, severity: str = "info"):
+    """Kirim log sistem ke Supabase via n8n untuk keperluan jurnal/audit."""
+    if not WEBHOOK_URL:
+        return
+    try:
+        payload = {
+            "type":       "system_log",
+            "event_type": event_type,
+            "component":  component,
+            "message":    message,
+            "metadata":   metadata or {},
+            "severity":   severity,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        headers = {"Content-Type": "application/json"}
+        if WEBHOOK_SECRET:
+            headers["X-Webhook-Secret"] = WEBHOOK_SECRET
+        requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=5)
+    except requests.RequestException:
+        pass  # Jangan sampai logging system gagal menghentikan proses utama
+
 def cleanup_old_records(con):
     cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
     con.execute("DELETE FROM ip_scores WHERE last_seen < ?", (cutoff,))
@@ -264,6 +292,7 @@ def tail_log(filepath: str):
         print(f"[WAIT] File {filepath} belum ada, coba lagi 2 detik...")
         time.sleep(2)
     print(f"[OK] File {filepath} ditemukan, mulai baca log...")
+    log_system_event("log_file_found", "python-analyzer", f"File log honeypot ditemukan: {filepath}", severity="info")
     with open(filepath, "r") as f:
         f.seek(0, 2)
         while True:
@@ -275,6 +304,7 @@ def tail_log(filepath: str):
 
 def main():
     print("[START] Python Analyzer + Ban Server aktif...")
+    log_system_event("startup", "python-analyzer", "Sistem Python Analyzer dimulai", severity="info")
 
     ban_thread = threading.Thread(target=start_ban_server, daemon=True)
     ban_thread.start()
@@ -350,6 +380,11 @@ def main():
             print(f"[WARN] Bukan JSON valid, skip: {raw_line[:80]}")
         except Exception as e:
             print(f"[ERROR] {e}")
+            log_system_event(
+                "processing_error", "python-analyzer",
+                f"Error saat memproses log: {str(e)}",
+                severity="error"
+            )
 
         cleanup_counter += 1
         if cleanup_counter >= 1000:
