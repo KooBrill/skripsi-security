@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Akses Diblokir — Bangun Karya</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f8fafc;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .card {
+    background: white;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 48px 40px;
+    max-width: 520px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+  }
+  .icon { font-size: 48px; margin-bottom: 20px; }
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 12px;
+  }
+  .subtitle {
+    font-size: 15px;
+    color: #64748b;
+    line-height: 1.6;
+    margin-bottom: 24px;
+  }
+  .detail-box {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+    text-align: left;
+  }
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid #fee2e2;
+    font-size: 13px;
+  }
+  .detail-row:last-child { border-bottom: none; }
+  .detail-label { color: #991b1b; font-weight: 600; }
+  .detail-value { color: #dc2626; font-family: monospace; }
+  .alert-box {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    text-align: left;
+  }
+  .alert-box p { font-size: 13px; color: #dc2626; line-height: 1.5; }
+  .alert-box strong { display: block; margin-bottom: 4px; color: #991b1b; }
+  .info-box {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 16px;
+    text-align: left;
+  }
+  .info-box p { font-size: 13px; color: #1d4ed8; line-height: 1.6; }
+  .info-box strong { display: block; margin-bottom: 4px; color: #1e40af; }
+  .permanent-badge {
+    display: inline-block;
+    background: #1e293b;
+    color: white;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 12px;
+    border-radius: 100px;
+    margin-bottom: 16px;
+    letter-spacing: 0.05em;
+  }
+  .footer { margin-top: 24px; font-size: 12px; color: #94a3b8; }
+  .countdown {
+    font-family: monospace;
+    font-size: 20px;
+    font-weight: 700;
+    color: #dc2626;
+    margin: 12px 0;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🚫</div>
+
+  <div id="permanent-badge" style="display:none;" class="permanent-badge">
+    BLOKIR PERMANEN
+  </div>
+
+  <h1>Akses Jaringan Anda Diblokir</h1>
+  <p class="subtitle">
+    Sistem keamanan kami mendeteksi aktivitas mencurigakan
+    dari jaringan Anda dan memblokir akses.
+  </p>
+
+  <div class="detail-box">
+    <div class="detail-row">
+      <span class="detail-label">Alamat IP</span>
+      <span class="detail-value" id="ip-value">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label">Jumlah Pelanggaran</span>
+      <span class="detail-value" id="ban-count-value">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label">Durasi Blokir</span>
+      <span class="detail-value" id="duration-value">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label">Sisa Waktu</span>
+      <span class="detail-value" id="ttl-value">—</span>
+    </div>
+  </div>
+
+  <div class="alert-box">
+    <strong>⚠️ Mengapa ini terjadi?</strong>
+    <p>
+      Seseorang dari jaringan Anda mencoba mengakses file atau
+      halaman yang bersifat sensitif dan tidak diizinkan untuk
+      diakses publik (contoh: /.env, /wp-admin, /.git). Aktivitas
+      ini terdeteksi sebagai indikasi percobaan peretasan.
+    </p>
+  </div>
+
+  <div class="info-box" id="temporary-info">
+    <strong>ℹ️ Apa yang harus dilakukan?</strong>
+    <p>
+      Pemblokiran ini bersifat <strong>sementara</strong> dan akan
+      otomatis berakhir sesuai durasi di atas. Jika Anda menggunakan
+      jaringan bersama (WiFi kampus, kantor, dll) dan merasa tidak
+      melakukan hal tersebut, kemungkinan pengguna lain di jaringan
+      yang sama yang memicunya.<br><br>
+      Perlu diperhatikan: durasi blokir akan meningkat setiap kali
+      jaringan Anda terdeteksi melakukan pelanggaran berulang.
+    </p>
+  </div>
+
+  <div class="info-box" id="permanent-info" style="display:none; background:#f1f5f9; border-color:#cbd5e1;">
+    <strong style="color:#334155;">🔒 Blokir Permanen</strong>
+    <p style="color:#475569;">
+      Jaringan Anda telah terdeteksi melakukan pelanggaran berulang
+      sebanyak 5 kali atau lebih. Sebagai tindakan pencegahan, akses
+      telah diblokir secara permanen melalui firewall. Jika Anda
+      merasa ini adalah kesalahan, silakan hubungi administrator
+      sistem untuk peninjauan lebih lanjut.
+    </p>
+  </div>
+
+  <p class="footer">
+    Bangun Karya Security System · Automated Protection
+  </p>
+</div>
+
+<script>
+  // Ambil info ban dari header response (dikirim Nginx dari Python)
+  // Nginx meneruskan header X-Ban-* ke halaman ini via query param
+  const params = new URLSearchParams(window.location.search);
+
+  const ip        = params.get('ip') || 'Tidak diketahui';
+  const banCount  = params.get('ban_count') || '1';
+  const duration  = params.get('duration') || '2 hari';
+  const ttlHours  = parseFloat(params.get('ttl') || '0');
+  const isPermanent = duration.toLowerCase().includes('permanen');
+
+  document.getElementById('ip-value').textContent = ip;
+  document.getElementById('ban-count-value').textContent = banCount + 'x';
+  document.getElementById('duration-value').textContent = duration;
+
+  if (isPermanent) {
+    document.getElementById('permanent-badge').style.display = 'inline-block';
+    document.getElementById('ttl-value').textContent = 'Tidak berakhir';
+    document.getElementById('temporary-info').style.display = 'none';
+    document.getElementById('permanent-info').style.display = 'block';
+  } else {
+    const days  = Math.floor(ttlHours / 24);
+    const hours = Math.floor(ttlHours % 24);
+    document.getElementById('ttl-value').textContent =
+      days > 0 ? `${days} hari ${hours} jam lagi` : `${hours} jam lagi`;
+  }
+</script>
+</body>
+</html>
