@@ -3,191 +3,191 @@ import json
 import sqlite3
 import requests
 import os
+import re
 import ipaddress
+
 from datetime import datetime, timedelta
 
 # ── Konfigurasi ──────────────────────────────────────────────
-LOG_PATH       = "/var/log/nginx/shared/threat_alert.log"
-DB_PATH        = "/app/db/threats.db"
-WEBHOOK_URL    = os.getenv("N8N_WEBHOOK_URL", "")
+LOG_PATH = "/var/log/nginx/shared/threat_alert.log"
+DB_PATH = "/app/db/threats.db"
+WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-SUPABASE_URL   = os.getenv("SUPABASE_URL", "")      # https://xxx.supabase.co
-SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")      # service_role key
-SCORE_LIMIT    = 100
+SCORE_LIMIT = 100
 RETENTION_DAYS = 30
 
-# Bobot ancaman: Dimensi 1 — Target
+# ═══════════════════════════════════════════════════════════
+# Bobot Ancaman: Dimensi 1 — Target (20+ endpoint)
+# ═══════════════════════════════════════════════════════════
 TARGET_WEIGHTS = {
-    ".env":         50,
-    ".git":         40,
-    "phpMyAdmin":   35,
-    "wp-admin":     30,
-    "wp-login.php": 30,
-    "admin":        20,
+    # Tier 1: Kritis (50-60 poin)
+    ".env": 60,
+    ".env.local": 60,
+    ".env.production": 60,
+    "wp-config.php": 60,
+    "config.php": 60,
+    "id_rsa": 60,
+    ".git/config": 55,
+    ".git/HEAD": 55,
+    ".sql": 55,
+    ".bak": 50,
+    "phpMyAdmin": 50,
+    "c99.php": 60,
+    "r57.php": 60,
+    
+    # Tier 2: Tinggi (35-49 poin)
+    ".git": 45,
+    ".svn": 45,
+    "Dockerfile": 45,
+    "docker-compose.yml": 45,
+    "aws-credentials": 45,
+    ".pem": 45,
+    ".key": 45,
+    "xmlrpc.php": 45,
+    "graphql": 40,
+    "swagger": 40,
+    "api-docs": 40,
+    
+    # Tier 3: Sedang (25-34 poin)
+    "wp-admin": 35,
+    "wp-login.php": 35,
+    "administrator": 35,
+    "admin": 30,
+    "panel": 30,
+    "phpinfo.php": 30,
+    "server-status": 30,
+    "debug": 30,
+    "actuator": 30,
+    "jenkins": 30,
+    
+    # Tier 4: Rendah (15-24 poin)
+    "api/v1": 20,
+    "rest/api": 20,
+    "soap": 20,
+    "webmail": 20,
+    "grafana": 20,
+    "kibana": 20,
 }
 
-# Bobot ancaman: Dimensi 2 — Alat
+# ═══════════════════════════════════════════════════════════
+# Bobot Ancaman: Dimensi 2 — Alat (25+ tools)
+# ═══════════════════════════════════════════════════════════
 UA_WEIGHTS = {
-    "sqlmap":          50,
-    "nikto":           35,
-    "nmap":            30,
-    "masscan":         30,
-    "nuclei":          45,
-    "zgrab":           25,
-    "dirbuster":       35,
-    "gobuster":        35,
-    "python-requests": 10,
-    "curl":             5,
+    # Offensive Tools (40-50 poin)
+    "sqlmap": 50,
+    "nikto": 45,
+    "nmap": 45,
+    "masscan": 45,
+    "nuclei": 45,
+    "metasploit": 50,
+    "burpsuite": 45,
+    "zap": 40,
+    "arachni": 40,
+    
+    # Recon Tools (30-39 poin)
+    "dirbuster": 35,
+    "gobuster": 35,
+    "dirb": 35,
+    "wfuzz": 35,
+    "ffuf": 35,
+    "subfinder": 30,
+    "amass": 30,
+    "theharvester": 30,
+    
+    # Automation (20-29 poin)
+    "python-requests": 25,
+    "python-urllib": 25,
+    "curl": 20,
+    "wget": 20,
+    "httpie": 20,
+    "postmanruntime": 15,
+    
+    # Bots (10-19 poin)
+    "zgrab": 25,
+    "semrushbot": 15,
+    "ahrefsbot": 15,
+    "mj12bot": 15,
 }
 
-# Bobot ancaman: Dimensi 3 — Human Heuristics
-BROWSER_SIGNATURES = ["chrome", "firefox", "safari", "edge", "opera"]
-HUMAN_PROBE_WEIGHT = 25
+# ═══════════════════════════════════════════════════════════
+# Bobot Tambahan: Human Behavior & Evasion
+# ═══════════════════════════════════════════════════════════
+HUMAN_BEHAVIOR_WEIGHTS = {
+    "manual_browser_probe": 25,  # Browser asli akses honeypot
+    "encoded_uri": 30,           # WAF bypass
+    "path_traversal": 45,        # Directory traversal
+}
 
-# Bobot ancaman: Dimensi 4 — WAF Bypass / Evasion
-WAF_BYPASS_PATTERNS = [
-    "%2e",      # URL-encoded dot (.)
-    "%2f",      # URL-encoded slash (/)
-    "%252e",    # Double-encoded dot
-    "%252f",    # Double-encoded slash
-    "..%2f",    # Path traversal variant
-    "%00",      # Null byte injection
-    "..;/",     # Tomcat path traversal
-]
-WAF_BYPASS_WEIGHT = 30
-
-# ── Filter IP Privat/NAT ─────────────────────────────────────
-def is_private_ip(ip: str) -> bool:
-    """Abaikan IP privat (192.168.x.x, 10.x.x.x, 172.16-31.x.x, 127.x.x.x)
-    untuk mencegah false positive dari jaringan internal."""
+# ── Helper: Cek IP Privat ───────────────────────────────────
+def is_private_ip(ip_str: str) -> bool:
+    """Cek apakah IP adalah IP Lokal/NAT (bukan dari internet)"""
     try:
-        return ipaddress.ip_address(ip).is_private
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback or ip.is_reserved
     except ValueError:
-        return False
+        return True
 
-# ── Setup Database ────────────────────────────────────────────
+# ── Setup Database SQLite dengan WAL Mode ───────────────────
 def init_db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=10.0)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA busy_timeout=5000;")
     con.execute("""
         CREATE TABLE IF NOT EXISTS ip_scores (
-            ip         TEXT PRIMARY KEY,
-            score      INTEGER DEFAULT 0,
-            last_seen  TEXT,
-            reported   INTEGER DEFAULT 0
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS threat_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   TEXT NOT NULL,
-            ip          TEXT NOT NULL,
-            method      TEXT,
-            uri         TEXT,
-            status      INTEGER,
-            user_agent  TEXT,
-            is_tool     INTEGER DEFAULT 0,
-            score_delta INTEGER DEFAULT 0,
-            score_total INTEGER DEFAULT 0
+            ip TEXT PRIMARY KEY,
+            score INTEGER DEFAULT 0,
+            last_seen TEXT,
+            reported INTEGER DEFAULT 0
         )
     """)
     con.commit()
     return con
 
-# ── Simpan Log Individual (SQLite) ────────────────────────────
-def insert_log(con, entry: dict, delta: int, total: int):
-    """Simpan setiap request honeypot ke SQLite lokal (backup)."""
-    con.execute("""
-        INSERT INTO threat_logs (timestamp, ip, method, uri, status, user_agent, is_tool, score_delta, score_total)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        entry.get("time", datetime.utcnow().isoformat()),
-        entry.get("ip", ""),
-        entry.get("method", ""),
-        entry.get("uri", ""),
-        entry.get("status", 0),
-        entry.get("ua", ""),
-        int(entry.get("tool", 0)),
-        delta,
-        total,
-    ))
-    con.commit()
-
-# ── Push Log ke Supabase ──────────────────────────────────────
-def push_to_supabase(entry: dict, delta: int, total: int):
-    """Kirim log ke Supabase agar bisa dilihat dari browser."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-    try:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/threat_logs",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            },
-            json={
-                "timestamp":   entry.get("time", datetime.utcnow().isoformat()),
-                "ip":          entry.get("ip", ""),
-                "method":      entry.get("method", ""),
-                "uri":         entry.get("uri", ""),
-                "status":      entry.get("status", 0),
-                "user_agent":  entry.get("ua", ""),
-                "is_tool":     int(entry.get("tool", 0)),
-                "score_delta": delta,
-                "score_total": total,
-            },
-            timeout=5,
-        )
-        if resp.status_code not in (200, 201):
-            print(f"[WARN] Supabase insert gagal: {resp.status_code} {resp.text[:100]}")
-    except requests.RequestException as e:
-        print(f"[WARN] Supabase error (skip): {e}")
-
-# ── Hitung Skor Ancaman (Multi-Dimensi) ──────────────────────
+# ── Hitung Skor Ancaman Multi-Dimensi ──────────────────────
 def calculate_score(uri: str, user_agent: str, is_tool: int) -> int:
     score = 0
-    ua_lower = user_agent.lower()
-    uri_lower = uri.lower()
-
-    # Dimensi 1: Target Weight
+    is_human_target = False
+    
+    # Dimensi 1: Target
     for target, weight in TARGET_WEIGHTS.items():
         if target in uri:
             score += weight
+            is_human_target = True
             break
-
-    # Dimensi 2: Tool Detection
-    is_known_tool = False
+    
+    # Dimensi 2: Tool/Bot
     if is_tool == 1:
         score += 30
-        is_known_tool = True
     else:
         for tool, weight in UA_WEIGHTS.items():
-            if tool.lower() in ua_lower:
+            if tool.lower() in user_agent.lower():
                 score += weight
-                is_known_tool = True
                 break
-
-    # Dimensi 3: Human Heuristics
-    # Browser asli mengakses honeypot = manual probing
-    is_browser = any(sig in ua_lower for sig in BROWSER_SIGNATURES)
-    if is_browser and not is_known_tool:
-        score += HUMAN_PROBE_WEIGHT
-
-    # Dimensi 4: WAF Bypass / Evasion Detection
-    if any(pattern in uri_lower for pattern in WAF_BYPASS_PATTERNS):
-        score += WAF_BYPASS_WEIGHT
-
+    
+    # Dimensi 3: Human Browser Probe
+    human_browsers = ['chrome', 'firefox', 'safari', 'edge', 'opera']
+    is_real_browser = any(browser in user_agent.lower() for browser in human_browsers)
+    if is_real_browser and is_human_target:
+        score += HUMAN_BEHAVIOR_WEIGHTS["manual_browser_probe"]
+    
+    # Dimensi 4: WAF Bypass (URL Encoding)
+    if re.search(r'%[0-9a-fA-F]{2}', uri):
+        score += HUMAN_BEHAVIOR_WEIGHTS["encoded_uri"]
+    
+    # Dimensi 5: Path Traversal
+    if re.search(r'\.\.[/\\]', uri) or re.search(r'%2[eE]%2[eE]', uri):
+        score += HUMAN_BEHAVIOR_WEIGHTS["path_traversal"]
+    
     return score
 
-# ── Update Skor IP ────────────────────────────────────────────
+# ── Update Skor IP di SQLite ────────────────────────────────
 def update_ip_score(con, ip: str, delta: int) -> dict:
     now = datetime.utcnow().isoformat()
     con.execute("""
         INSERT INTO ip_scores (ip, score, last_seen, reported)
         VALUES (?, ?, ?, 0)
         ON CONFLICT(ip) DO UPDATE SET
-            score     = score + excluded.score,
+            score = score + excluded.score,
             last_seen = excluded.last_seen
     """, (ip, delta, now))
     con.commit()
@@ -196,32 +196,32 @@ def update_ip_score(con, ip: str, delta: int) -> dict:
     ).fetchone()
     return {"score": row[0], "reported": row[1]}
 
-# ── Kirim Webhook ke n8n ──────────────────────────────────────
-def trigger_webhook(ip: str, score: int):
+# ── Kirim ke n8n ────────────────────────────────────────────
+def trigger_webhook(payload: dict):
     if not WEBHOOK_URL:
-        print(f"[WARN] WEBHOOK_URL belum di-set. Skip untuk {ip}")
+        print(f"[WARN] WEBHOOK_URL belum di-set. Skip.")
         return
     try:
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if WEBHOOK_SECRET:
             headers["X-Webhook-Secret"] = WEBHOOK_SECRET
-        resp = requests.post(WEBHOOK_URL, json={
-            "ip_address": ip,
-            "score":      score,
-            "timestamp":  datetime.utcnow().isoformat()
-        }, headers=headers, timeout=5)
-        print(f"[ALERT] Webhook terkirim untuk {ip} (skor: {score}) → {resp.status_code}")
+        resp = requests.post(
+            WEBHOOK_URL,
+            json=payload,
+            headers=headers,
+            timeout=5
+        )
+        print(f"[WEBHOOK] type={payload['type']} ip={payload['ip_address']} → {resp.status_code}")
     except requests.RequestException as e:
         print(f"[ERROR] Gagal kirim webhook: {e}")
 
-# ── Hapus Data Lama ──────────────────────────────────────────
+# ── Hapus Data Lama ─────────────────────────────────────────
 def cleanup_old_records(con):
     cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
     con.execute("DELETE FROM ip_scores WHERE last_seen < ?", (cutoff,))
-    con.execute("DELETE FROM threat_logs WHERE timestamp < ?", (cutoff,))
     con.commit()
 
-# ── Baca Log Real-time ───────────────────────────────────────
+# ── Baca Log Real-time ──────────────────────────────────────
 def tail_log(filepath: str):
     while not os.path.exists(filepath):
         print(f"[WAIT] File {filepath} belum ada, coba lagi 2 detik...")
@@ -236,46 +236,62 @@ def tail_log(filepath: str):
             else:
                 time.sleep(0.5)
 
-# ── Main Loop ────────────────────────────────────────────────
+# ── Main Loop ───────────────────────────────────────────────
 def main():
     print("[START] Python Analyzer aktif...")
     con = init_db()
     cleanup_counter = 0
-
+    
     for raw_line in tail_log(LOG_PATH):
         try:
-            entry      = json.loads(raw_line)
-            ip         = entry.get("ip", "")
-            uri        = entry.get("uri", "")
+            entry = json.loads(raw_line)
+            ip = entry.get("ip", "")
+            uri = entry.get("uri", "")
             user_agent = entry.get("ua", "")
-            is_tool    = int(entry.get("tool", 0))
-
+            is_tool = int(entry.get("tool", 0))
+            now = datetime.utcnow().isoformat()
+            
             if not ip:
                 continue
-
-            # Filter IP Privat/NAT — cegah false positive internal
+            
+            # 🛡️ Skip IP Privat/NAT
             if is_private_ip(ip):
                 continue
-
-            delta  = calculate_score(uri, user_agent, is_tool)
+            
+            # Hitung skor
+            delta = calculate_score(uri, user_agent, is_tool)
             result = update_ip_score(con, ip, delta)
-
-            # Simpan log individual
-            insert_log(con, entry, delta, result["score"])  # SQLite (backup lokal)
-            push_to_supabase(entry, delta, result["score"])  # Supabase (bisa cek dari browser)
-
-            print(f"[LOG] {ip} | +{delta} poin | Total: {result['score']}")
-
+            print(f"[LOG] {ip} | uri={uri} | +{delta} poin | Total: {result['score']}")
+            
+            # Kirim setiap hit ke n8n
+            trigger_webhook({
+                "type": "hit",
+                "ip_address": ip,
+                "uri": uri,
+                "user_agent": user_agent,
+                "score_delta": delta,
+                "total_score": result["score"],
+                "is_tool": is_tool == 1,
+                "detected_at": now
+            })
+            
+            # Kalau skor >= 100 dan belum pernah diblokir
             if result["score"] >= SCORE_LIMIT and result["reported"] == 0:
-                trigger_webhook(ip, result["score"])
+                print(f"[ALERT] {ip} melewati batas skor {SCORE_LIMIT} → BLOKIR")
+                trigger_webhook({
+                    "type": "ban",
+                    "ip_address": ip,
+                    "final_score": result["score"],
+                    "banned_at": now
+                })
                 con.execute("UPDATE ip_scores SET reported = 1 WHERE ip = ?", (ip,))
                 con.commit()
-
+                
         except json.JSONDecodeError:
             print(f"[WARN] Bukan JSON valid, skip: {raw_line[:80]}")
         except Exception as e:
             print(f"[ERROR] {e}")
-
+        
         cleanup_counter += 1
         if cleanup_counter >= 1000:
             cleanup_old_records(con)
