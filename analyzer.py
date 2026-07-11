@@ -7,7 +7,6 @@ import os
 import re
 import ipaddress
 import threading
-import hashlib
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -24,30 +23,27 @@ RETENTION_DAYS = 30
 
 # ═══════════════════════════════════════════════════════════
 # Progressive Ban Duration
-# Ban ke-1 → 2 hari   (Redis, auto-expire)
-# Ban ke-2 → 5 hari   (Redis, auto-expire)
-# Ban ke-3 → 10 hari  (Redis, auto-expire)
-# Ban ke-4 → 20 hari  (Redis, auto-expire)
-# Ban ke-5+ → PERMANEN via UFW (eskalasi ke n8n → SSH)
+# ban_count: 1 → 2 hari | 2 → 5 hari | 3 → 10 hari | 4+ → 30 hari
+# ban_count: 5+ → ESKALASI ke UFW permanen via n8n
 # ═══════════════════════════════════════════════════════════
 BAN_SCHEDULE = {
     1: 60 * 60 * 24 * 2,
     2: 60 * 60 * 24 * 5,
     3: 60 * 60 * 24 * 10,
-    4: 60 * 60 * 24 * 20,
 }
-PERMANENT_BAN_THRESHOLD = 5  # ban ke-5 dan seterusnya → permanen
+BAN_MAX = 60 * 60 * 24 * 30
+PERMANENT_BAN_THRESHOLD = 5
 
 def get_ban_duration(ban_count: int) -> int:
-    return BAN_SCHEDULE.get(ban_count, 60 * 60 * 24 * 20)
+    return BAN_SCHEDULE.get(ban_count, BAN_MAX)
 
 def get_ban_label(ban_count: int) -> str:
-    labels = {1: "2 hari", 2: "5 hari", 3: "10 hari", 4: "20 hari"}
-    return labels.get(ban_count, "20 hari")
+    labels = {1: "2 hari", 2: "5 hari", 3: "10 hari"}
+    return labels.get(ban_count, "30 hari")
 
-def is_permanent_threshold(ban_count: int) -> bool:
-    return ban_count >= PERMANENT_BAN_THRESHOLD
-
+# ═══════════════════════════════════════════════════════════
+# Bobot Ancaman: Dimensi 1 — Target (30+ endpoint)
+# ═══════════════════════════════════════════════════════════
 TARGET_WEIGHTS = {
     ".env": 60, ".env.local": 60, ".env.production": 60,
     "wp-config.php": 60, "config.php": 60, "id_rsa": 60,
@@ -63,6 +59,9 @@ TARGET_WEIGHTS = {
     "grafana": 20, "kibana": 20,
 }
 
+# ═══════════════════════════════════════════════════════════
+# Bobot Ancaman: Dimensi 2 — Alat (25+ tools)
+# ═══════════════════════════════════════════════════════════
 UA_WEIGHTS = {
     "sqlmap": 50, "nikto": 45, "nmap": 45, "masscan": 45, "nuclei": 45,
     "metasploit": 50, "burpsuite": 45, "zap": 40, "arachni": 40,
@@ -79,8 +78,7 @@ HUMAN_BEHAVIOR_WEIGHTS = {
     "path_traversal": 45,
 }
 
-FINGERPRINT_MULTI_IP_BONUS = 15  # Bonus skor kalau fingerprint yang sama muncul dari IP berbeda
-
+# ── Helper: Cek IP Privat ──────────────────────────────────────
 def is_private_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -88,102 +86,34 @@ def is_private_ip(ip_str: str) -> bool:
     except ValueError:
         return True
 
+# ── Koneksi Redis ───────────────────────────────────────────────
 def get_redis():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-# ── Simple HTTP Fingerprint ──────────────────────────────────
-def generate_fingerprint(user_agent: str, accept_lang: str, accept_enc: str) -> str:
-    """Generate hash fingerprint sederhana dari header HTTP.
-    Bukan JA3 asli, tapi cukup untuk bedakan device di jaringan yang sama
-    dan deteksi IP rotation dari device yang sama."""
-    raw = f"{user_agent}|{accept_lang}|{accept_enc}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-def track_fingerprint(con, fingerprint: str, ip: str) -> dict:
-    """Track fingerprint dan IP yang terkait.
-    Return info apakah fingerprint ini sudah terlihat dari IP lain."""
-    now = datetime.utcnow().isoformat()
-    con.execute("""
-        INSERT INTO fingerprint_tracking (fingerprint, ip, first_seen, last_seen, hit_count)
-        VALUES (?, ?, ?, ?, 1)
-        ON CONFLICT(fingerprint, ip) DO UPDATE SET
-            last_seen  = excluded.last_seen,
-            hit_count  = hit_count + 1
-    """, (fingerprint, ip, now, now))
-    con.commit()
-
-    # Cek berapa IP unik yang pakai fingerprint ini
-    row = con.execute(
-        "SELECT COUNT(DISTINCT ip) FROM fingerprint_tracking WHERE fingerprint = ?",
-        (fingerprint,)
-    ).fetchone()
-    unique_ips = row[0] if row else 1
-
-    # Ambil daftar IP-nya untuk logging
-    ip_rows = con.execute(
-        "SELECT ip FROM fingerprint_tracking WHERE fingerprint = ? ORDER BY last_seen DESC LIMIT 10",
-        (fingerprint,)
-    ).fetchall()
-    associated_ips = [r[0] for r in ip_rows]
-
-    return {
-        "fingerprint": fingerprint,
-        "unique_ips": unique_ips,
-        "associated_ips": associated_ips,
-        "is_multi_ip": unique_ips > 1
-    }
-
-def get_fingerprint_bonus(fp_info: dict) -> int:
-    """Hitung bonus skor berdasarkan fingerprint.
-    Kalau fingerprint yang sama muncul dari IP berbeda → kemungkinan IP rotation."""
-    if fp_info["is_multi_ip"]:
-        return FINGERPRINT_MULTI_IP_BONUS
-    return 0
-
-# ── Ban IP — Progressive, eskalasi ke permanen di ban ke-5 ────
+# ── Ban IP ke Redis (Progressive) ───────────────────────────────
 def ban_ip(ip: str, score: int) -> dict:
     r = get_redis()
     ban_count_key = f"ban_count:{ip}"
-    ban_count = r.incr(ban_count_key)  # Riwayat permanen, tidak pernah reset
+    ban_count = r.incr(ban_count_key)
 
-    is_permanent = is_permanent_threshold(ban_count)
-
-    if is_permanent:
-        # Ban ke-5+ → tetap catat di Redis sebagai penanda,
-        # tapi TTL sangat panjang (1 tahun) karena akan dihandle UFW
-        duration = 60 * 60 * 24 * 365
-        label    = "PERMANEN (UFW)"
-    else:
-        duration = get_ban_duration(ban_count)
-        label    = get_ban_label(ban_count)
-
+    duration   = get_ban_duration(ban_count)
+    label      = get_ban_label(ban_count)
     expires_at = datetime.utcnow() + timedelta(seconds=duration)
 
     ban_data = {
-        "ip":            ip,
-        "score":         score,
-        "ban_count":     ban_count,
-        "duration":      label,
-        "is_permanent":  is_permanent,
-        "banned_at":     datetime.utcnow().isoformat(),
-        "expires_at":    expires_at.isoformat()
+        "ip":         ip,
+        "score":      score,
+        "ban_count":  ban_count,
+        "duration":   label,
+        "banned_at":  datetime.utcnow().isoformat(),
+        "expires_at": expires_at.isoformat()
     }
 
     r.setex(f"banned:{ip}", duration, json.dumps(ban_data))
-
-    if is_permanent:
-        print(f"[PERMANENT BAN] {ip} | ban ke-{ban_count} → ESKALASI KE UFW")
-    else:
-        print(f"[BAN] {ip} | ban ke-{ban_count} | durasi: {label} | skor: {score}")
-    log_system_event(
-        "ban_executed", "python-analyzer",
-        f"IP {ip} diblokir (ban ke-{ban_count})",
-        metadata={"ip": ip, "ban_count": ban_count, "duration": label, "score": score},
-        severity="warning"
-    )
-
+    print(f"[BAN] {ip} | ban ke-{ban_count} | durasi: {label} | skor: {score}")
     return ban_data
 
+# ── Cek apakah IP banned ────────────────────────────────────────
 def is_banned(ip: str):
     r = get_redis()
     data = r.get(f"banned:{ip}")
@@ -194,22 +124,18 @@ def is_banned(ip: str):
         return info
     return None
 
-# ── Mini HTTP Server untuk Nginx auth_request ─────────────────
+# ── Mini HTTP Server untuk Nginx auth_request ────────────────────
 class BanCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
-
         if parsed.path == "/check":
             params = parse_qs(parsed.query)
             ip = params.get("ip", [""])[0]
-
             if not ip:
                 self.send_response(400)
                 self.end_headers()
                 return
-
             ban_info = is_banned(ip)
-
             if ban_info:
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
@@ -226,13 +152,14 @@ class BanCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        pass  # Suppress default HTTP access log
+        pass
 
 def start_ban_server():
     server = HTTPServer(("0.0.0.0", 8080), BanCheckHandler)
     print("[BAN SERVER] Jalan di port 8080")
     server.serve_forever()
 
+# ── Setup Database SQLite (WAL Mode) ─────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_PATH, timeout=10.0)
     con.execute("PRAGMA journal_mode=WAL;")
@@ -245,19 +172,10 @@ def init_db():
             reported   INTEGER DEFAULT 0
         )
     """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS fingerprint_tracking (
-            fingerprint TEXT NOT NULL,
-            ip          TEXT NOT NULL,
-            first_seen  TEXT,
-            last_seen   TEXT,
-            hit_count   INTEGER DEFAULT 0,
-            PRIMARY KEY (fingerprint, ip)
-        )
-    """)
     con.commit()
     return con
 
+# ── Hitung Skor Ancaman Multi-Dimensi ────────────────────────────
 def calculate_score(uri: str, user_agent: str, is_tool: int) -> int:
     score = 0
     is_human_target = False
@@ -289,6 +207,7 @@ def calculate_score(uri: str, user_agent: str, is_tool: int) -> int:
 
     return score
 
+# ── Update Skor IP di SQLite ─────────────────────────────────────
 def update_ip_score(con, ip: str, delta: int) -> dict:
     now = datetime.utcnow().isoformat()
     con.execute("""
@@ -309,6 +228,7 @@ def reset_ip_score(con, ip: str):
     con.commit()
     print(f"[RESET] Skor {ip} direset setelah ban")
 
+# ── Kirim ke n8n ──────────────────────────────────────────────────
 def trigger_webhook(payload: dict):
     if not WEBHOOK_URL:
         print(f"[WARN] WEBHOOK_URL belum di-set. Skip.")
@@ -318,10 +238,11 @@ def trigger_webhook(payload: dict):
         if WEBHOOK_SECRET:
             headers["X-Webhook-Secret"] = WEBHOOK_SECRET
         resp = requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=5)
-        print(f"[WEBHOOK] type={payload['type']} ip={payload['ip_address']} → {resp.status_code}")
+        print(f"[WEBHOOK] type={payload.get('type')} ip={payload.get('ip_address', '-')} → {resp.status_code}")
     except requests.RequestException as e:
         print(f"[ERROR] Gagal kirim webhook: {e}")
 
+# ── Log Sistem untuk Jurnal/Audit ────────────────────────────────
 def log_system_event(event_type: str, component: str, message: str,
                       metadata: dict = None, severity: str = "info"):
     """Kirim log sistem ke Supabase via n8n untuk keperluan jurnal/audit."""
@@ -342,20 +263,22 @@ def log_system_event(event_type: str, component: str, message: str,
             headers["X-Webhook-Secret"] = WEBHOOK_SECRET
         requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=5)
     except requests.RequestException:
-        pass  # Jangan sampai logging system gagal menghentikan proses utama
+        pass  # Jangan sampai logging gagal menghentikan proses utama
 
+# ── Hapus Data Lama ───────────────────────────────────────────────
 def cleanup_old_records(con):
     cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
     con.execute("DELETE FROM ip_scores WHERE last_seen < ?", (cutoff,))
-    con.execute("DELETE FROM fingerprint_tracking WHERE last_seen < ?", (cutoff,))
     con.commit()
 
+# ── Baca Log Real-time ─────────────────────────────────────────────
 def tail_log(filepath: str):
     while not os.path.exists(filepath):
         print(f"[WAIT] File {filepath} belum ada, coba lagi 2 detik...")
         time.sleep(2)
     print(f"[OK] File {filepath} ditemukan, mulai baca log...")
-    log_system_event("log_file_found", "python-analyzer", f"File log honeypot ditemukan: {filepath}", severity="info")
+    log_system_event("log_file_found", "python-analyzer",
+                      f"File log honeypot ditemukan: {filepath}", severity="info")
     with open(filepath, "r") as f:
         f.seek(0, 2)
         while True:
@@ -365,9 +288,11 @@ def tail_log(filepath: str):
             else:
                 time.sleep(0.5)
 
+# ── Main Loop ────────────────────────────────────────────────────────
 def main():
     print("[START] Python Analyzer + Ban Server aktif...")
-    log_system_event("startup", "python-analyzer", "Sistem Python Analyzer dimulai", severity="info")
+    log_system_event("startup", "python-analyzer",
+                      "Sistem Python Analyzer dimulai", severity="info")
 
     ban_thread = threading.Thread(target=start_ban_server, daemon=True)
     ban_thread.start()
@@ -378,42 +303,29 @@ def main():
     for raw_line in tail_log(LOG_PATH):
         try:
             entry      = json.loads(raw_line)
-            ip          = entry.get("ip", "")
-            uri         = entry.get("uri", "")
-            user_agent  = entry.get("ua", "")
-            accept_lang = entry.get("accept_lang", "")
-            accept_enc  = entry.get("accept_enc", "")
-            is_tool     = int(entry.get("tool", 0))
-            now         = datetime.utcnow().isoformat()
+            ip         = entry.get("ip", "")
+            uri        = entry.get("uri", "")
+            user_agent = entry.get("ua", "")
+            is_tool    = int(entry.get("tool", 0))
+            now        = datetime.utcnow().isoformat()
 
             if not ip:
                 continue
+
             if is_private_ip(ip):
                 continue
 
-            # ── Fingerprint ──────────────────────────────
-            fingerprint = generate_fingerprint(user_agent, accept_lang, accept_enc)
-            fp_info     = track_fingerprint(con, fingerprint, ip)
-            fp_bonus    = get_fingerprint_bonus(fp_info)
-
-            if fp_info["is_multi_ip"]:
-                print(f"[FINGERPRINT] {fingerprint} terdeteksi dari {fp_info['unique_ips']} IP berbeda: {fp_info['associated_ips']}")
-
-            delta  = calculate_score(uri, user_agent, is_tool) + fp_bonus
+            delta  = calculate_score(uri, user_agent, is_tool)
             result = update_ip_score(con, ip, delta)
 
-            print(f"[LOG] {ip} | fp={fingerprint} | uri={uri} | +{delta} poin (fp_bonus=+{fp_bonus}) | Total: {result['score']}")
+            print(f"[LOG] {ip} | uri={uri} | +{delta} poin | Total: {result['score']}")
 
             trigger_webhook({
                 "type":        "hit",
                 "ip_address":  ip,
                 "uri":         uri,
                 "user_agent":  user_agent,
-                "fingerprint": fingerprint,
-                "fp_unique_ips": fp_info["unique_ips"],
-                "fp_is_multi_ip": fp_info["is_multi_ip"],
                 "score_delta": delta,
-                "fp_bonus":    fp_bonus,
                 "total_score": result["score"],
                 "is_tool":     is_tool == 1,
                 "detected_at": now
@@ -426,32 +338,34 @@ def main():
                 con.execute("UPDATE ip_scores SET reported = 1 WHERE ip = ?", (ip,))
                 con.commit()
 
-                # Payload dasar — selalu dikirim untuk log_banned
-                payload = {
-                    "type":         "ban",
+                is_permanent = ban_info["ban_count"] >= PERMANENT_BAN_THRESHOLD
+
+                trigger_webhook({
+                    "type":         "ban_permanent" if is_permanent else "ban",
                     "ip_address":   ip,
                     "final_score":  result["score"],
                     "ban_count":    ban_info["ban_count"],
-                    "duration":     ban_info["duration"],
-                    "is_permanent": ban_info["is_permanent"],
+                    "duration":     "PERMANEN" if is_permanent else ban_info["duration"],
                     "banned_at":    now,
-                    "expires_at":   ban_info["expires_at"]
-                }
-                trigger_webhook(payload)
+                    "expires_at":   None if is_permanent else ban_info["expires_at"]
+                })
 
-                # ═══════════════════════════════════════════
-                # ESKALASI: ban ke-5+ → trigger SSH/UFW via n8n
-                # Payload type berbeda agar n8n bisa bedakan
-                # ═══════════════════════════════════════════
-                if ban_info["is_permanent"]:
-                    print(f"[ESCALATE] {ip} sudah {ban_info['ban_count']}x kena ban → kirim sinyal UFW permanen")
-                    trigger_webhook({
-                        "type":       "ban_permanent",
-                        "ip_address": ip,
-                        "ban_count":  ban_info["ban_count"],
-                        "final_score": result["score"],
-                        "banned_at":  now
-                    })
+                log_system_event(
+                    "ban_executed", "python-analyzer",
+                    f"IP {ip} diblokir (ban ke-{ban_info['ban_count']})",
+                    metadata={"ip": ip, "ban_count": ban_info["ban_count"],
+                              "duration": ban_info["duration"], "score": result["score"]},
+                    severity="warning"
+                )
+
+                if is_permanent:
+                    print(f"[ESCALATION] {ip} sudah {ban_info['ban_count']}x kena ban → eskalasi ke UFW PERMANEN")
+                    log_system_event(
+                        "ban_escalated", "python-analyzer",
+                        f"IP {ip} dieskalasi ke blokir permanen setelah {ban_info['ban_count']} pelanggaran",
+                        metadata={"ip": ip, "ban_count": ban_info["ban_count"]},
+                        severity="critical"
+                    )
 
         except json.JSONDecodeError:
             print(f"[WARN] Bukan JSON valid, skip: {raw_line[:80]}")
