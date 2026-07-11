@@ -7,6 +7,7 @@ import os
 import re
 import ipaddress
 import threading
+import hashlib
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -78,6 +79,8 @@ HUMAN_BEHAVIOR_WEIGHTS = {
     "path_traversal": 45,
 }
 
+FINGERPRINT_MULTI_IP_BONUS = 15  # Bonus skor kalau fingerprint yang sama muncul dari IP berbeda
+
 def is_private_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -87,6 +90,55 @@ def is_private_ip(ip_str: str) -> bool:
 
 def get_redis():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# ── Simple HTTP Fingerprint ──────────────────────────────────
+def generate_fingerprint(user_agent: str, accept_lang: str, accept_enc: str) -> str:
+    """Generate hash fingerprint sederhana dari header HTTP.
+    Bukan JA3 asli, tapi cukup untuk bedakan device di jaringan yang sama
+    dan deteksi IP rotation dari device yang sama."""
+    raw = f"{user_agent}|{accept_lang}|{accept_enc}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+def track_fingerprint(con, fingerprint: str, ip: str) -> dict:
+    """Track fingerprint dan IP yang terkait.
+    Return info apakah fingerprint ini sudah terlihat dari IP lain."""
+    now = datetime.utcnow().isoformat()
+    con.execute("""
+        INSERT INTO fingerprint_tracking (fingerprint, ip, first_seen, last_seen, hit_count)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(fingerprint, ip) DO UPDATE SET
+            last_seen  = excluded.last_seen,
+            hit_count  = hit_count + 1
+    """, (fingerprint, ip, now, now))
+    con.commit()
+
+    # Cek berapa IP unik yang pakai fingerprint ini
+    row = con.execute(
+        "SELECT COUNT(DISTINCT ip) FROM fingerprint_tracking WHERE fingerprint = ?",
+        (fingerprint,)
+    ).fetchone()
+    unique_ips = row[0] if row else 1
+
+    # Ambil daftar IP-nya untuk logging
+    ip_rows = con.execute(
+        "SELECT ip FROM fingerprint_tracking WHERE fingerprint = ? ORDER BY last_seen DESC LIMIT 10",
+        (fingerprint,)
+    ).fetchall()
+    associated_ips = [r[0] for r in ip_rows]
+
+    return {
+        "fingerprint": fingerprint,
+        "unique_ips": unique_ips,
+        "associated_ips": associated_ips,
+        "is_multi_ip": unique_ips > 1
+    }
+
+def get_fingerprint_bonus(fp_info: dict) -> int:
+    """Hitung bonus skor berdasarkan fingerprint.
+    Kalau fingerprint yang sama muncul dari IP berbeda → kemungkinan IP rotation."""
+    if fp_info["is_multi_ip"]:
+        return FINGERPRINT_MULTI_IP_BONUS
+    return 0
 
 # ── Ban IP — Progressive, eskalasi ke permanen di ban ke-5 ────
 def ban_ip(ip: str, score: int) -> dict:
@@ -193,6 +245,16 @@ def init_db():
             reported   INTEGER DEFAULT 0
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS fingerprint_tracking (
+            fingerprint TEXT NOT NULL,
+            ip          TEXT NOT NULL,
+            first_seen  TEXT,
+            last_seen   TEXT,
+            hit_count   INTEGER DEFAULT 0,
+            PRIMARY KEY (fingerprint, ip)
+        )
+    """)
     con.commit()
     return con
 
@@ -285,6 +347,7 @@ def log_system_event(event_type: str, component: str, message: str,
 def cleanup_old_records(con):
     cutoff = (datetime.utcnow() - timedelta(days=RETENTION_DAYS)).isoformat()
     con.execute("DELETE FROM ip_scores WHERE last_seen < ?", (cutoff,))
+    con.execute("DELETE FROM fingerprint_tracking WHERE last_seen < ?", (cutoff,))
     con.commit()
 
 def tail_log(filepath: str):
@@ -315,28 +378,42 @@ def main():
     for raw_line in tail_log(LOG_PATH):
         try:
             entry      = json.loads(raw_line)
-            ip         = entry.get("ip", "")
-            uri        = entry.get("uri", "")
-            user_agent = entry.get("ua", "")
-            is_tool    = int(entry.get("tool", 0))
-            now        = datetime.utcnow().isoformat()
+            ip          = entry.get("ip", "")
+            uri         = entry.get("uri", "")
+            user_agent  = entry.get("ua", "")
+            accept_lang = entry.get("accept_lang", "")
+            accept_enc  = entry.get("accept_enc", "")
+            is_tool     = int(entry.get("tool", 0))
+            now         = datetime.utcnow().isoformat()
 
             if not ip:
                 continue
             if is_private_ip(ip):
                 continue
 
-            delta  = calculate_score(uri, user_agent, is_tool)
+            # ── Fingerprint ──────────────────────────────
+            fingerprint = generate_fingerprint(user_agent, accept_lang, accept_enc)
+            fp_info     = track_fingerprint(con, fingerprint, ip)
+            fp_bonus    = get_fingerprint_bonus(fp_info)
+
+            if fp_info["is_multi_ip"]:
+                print(f"[FINGERPRINT] {fingerprint} terdeteksi dari {fp_info['unique_ips']} IP berbeda: {fp_info['associated_ips']}")
+
+            delta  = calculate_score(uri, user_agent, is_tool) + fp_bonus
             result = update_ip_score(con, ip, delta)
 
-            print(f"[LOG] {ip} | uri={uri} | +{delta} poin | Total: {result['score']}")
+            print(f"[LOG] {ip} | fp={fingerprint} | uri={uri} | +{delta} poin (fp_bonus=+{fp_bonus}) | Total: {result['score']}")
 
             trigger_webhook({
                 "type":        "hit",
                 "ip_address":  ip,
                 "uri":         uri,
                 "user_agent":  user_agent,
+                "fingerprint": fingerprint,
+                "fp_unique_ips": fp_info["unique_ips"],
+                "fp_is_multi_ip": fp_info["is_multi_ip"],
                 "score_delta": delta,
+                "fp_bonus":    fp_bonus,
                 "total_score": result["score"],
                 "is_tool":     is_tool == 1,
                 "detected_at": now
